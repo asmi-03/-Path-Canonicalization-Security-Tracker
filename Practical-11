@@ -1,0 +1,165 @@
+const express = require('express');
+const morgan = require('morgan');
+const fs = require('fs');
+const path = require('path');
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+// Tracker for canonical paths and their original request forms
+const patternTracker = new Map();
+const SNAPSHOT_FILE = path.resolve(__dirname, 'pattern-snapshots.json');
+
+// Function to save the tracker state to a file
+function saveSnapshot() {
+    try {
+        const obj = {};
+        for (const [k, v] of patternTracker.entries()) {
+            obj[k] = { count: v.count, originals: Array.from(v.originals) };
+        }
+        fs.writeFileSync(SNAPSHOT_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (err) {
+        console.error('Failed to save snapshot:', err);
+    }
+}
+
+// Function to canonicalize the URL path using POSIX rules
+function canonicalizeUrlPath(rawPath) {
+    if (!rawPath.startsWith('/')) rawPath = '/' + rawPath;
+    let canon = path.posix.normalize(rawPath);
+    // Preserve trailing slash for non-root paths if it existed originally
+    if (canon !== '/' && rawPath.endsWith('/') && !canon.endsWith('/')) {
+        // NOTE: path.posix.normalize removes trailing slash if not root. 
+        // We'll skip adding it back for simplicity in this tracker, 
+        // relying strictly on the normalized form.
+    }
+    return canon;
+}
+
+// Middleware for logging and canonicalization/tracking
+app.use(morgan('dev'));
+app.use((req, res, next) => {
+    const original = req.originalUrl || req.url; 
+    const pathname = req.path; 
+    const canonical = canonicalizeUrlPath(pathname);
+
+    if (!patternTracker.has(canonical)) {
+        patternTracker.set(canonical, { count: 0, originals: new Set() });
+    }
+    const record = patternTracker.get(canonical);
+    record.count += 1;
+    record.originals.add(original);
+    
+    // Attach data to request for later use
+    req.canonicalPath = canonical;
+    req.canonicalRecord = record;
+    next();
+});
+
+// --- Website Routes ---
+
+app.get('/', (req, res) => {
+    res.type('html').send(`
+        <h1>Welcome</h1>
+        <p>This is a demo site. Try visiting paths like:</p>
+        <ul>
+            <li>/about</li>
+            <li>/about/</li>
+            <li>/a//b</li>
+            <li>/a/./b</li>
+            <li>/a/b/../b</li>
+            <li>/static-file/myimage.png (requires /public folder)</li>
+        </ul>
+        <p>Check <a href="/patterns">/patterns</a> to see tracked patterns.</p>
+    `);
+});
+
+app.get('/about', (req, res) => {
+    res.send('<h2>About page</h2><p>Example content.</p>');
+});
+
+// Route to serve files safely from the 'public' directory
+app.get('/static-file/*', (req, res) => {
+    // 1. Get the path part after '/static-file/'
+    const rel = req.params[0] || ''; 
+    
+    // 2. Canonicalize the relative path for safety, then strip leading slash
+    const safeRel = path.posix.normalize('/' + rel).replace(/^\//, ''); 
+    
+    // 3. Define the trusted root directory
+    const publicDir = path.resolve(__dirname, 'public'); 
+    
+    // 4. Construct the full requested path on the filesystem
+    // We use path.resolve(root, relative) for absolute pathing, which correctly 
+    // uses the OS separator (e.g., backslash on Windows).
+    const requestedFsPath = path.resolve(publicDir, safeRel);
+
+    // 5. SECURITY CHECK: Directory Traversal Prevention
+    if (!requestedFsPath.startsWith(publicDir)) {
+        console.warn(`Traversal attempt blocked: ${req.originalUrl} -> ${requestedFsPath}`);
+        return res.status(403).send('Forbidden');
+    }
+
+    // 6. Check if file exists and serve
+    if (fs.existsSync(requestedFsPath) && fs.statSync(requestedFsPath).isFile()) {
+        res.sendFile(requestedFsPath);
+    } else {
+        res.status(404).send('Not found');
+    }
+});
+
+app.get('/patterns', (req, res) => {
+    const rows = [];
+    for (const [canon, data] of patternTracker.entries()) {
+        rows.push({
+            canonical: canon,
+            count: data.count,
+            aliases: Array.from(data.originals).slice(0, 50), 
+            redundancyDetected: data.originals.size > 1
+        });
+    }
+    const html = `
+        <h1>Tracked URL Patterns</h1>
+        <p>Tracked at: ${new Date().toISOString()}</p>
+        <table border="1" cellpadding="6" cellspacing="0">
+        <tr><th>Canonical Path</th><th>Count</th><th>Redundancy?</th><th>Some original forms</th></tr>
+        ${rows.map(r => `
+            <tr>
+            <td><code>${r.canonical}</code></td>
+            <td style="text-align:right">${r.count}</td>
+            <td>${r.redundancyDetected ? '<strong>Yes</strong>' : 'No'}</td>
+            <td><pre style="white-space:pre-wrap;max-width:600px;font-size:0.8em">${r.aliases.join('\n')}</pre></td>
+            </tr>
+        `).join('')}
+        </table>
+        <h2>Notes</h2>
+        <p>We normalize incoming paths with <code>path.posix.normalize</code> to collapse duplicates like <code>//</code>, <code>/./</code> and resolve <code>/..</code>, thus identifying redundancy.</p>
+    `;
+    // Save snapshot asynchronously after sending response
+    setImmediate(saveSnapshot); 
+    res.type('html').send(html);
+});
+
+app.get('/which-path', (req, res) => {
+    const explanation = `
+        <h1>Which 'path' method did we use?</h1>
+        <ul>
+            <li><strong>For URL normalization</strong>: <code>path.posix.normalize()</code>.
+            Reason: URLs use forward slashes (POSIX-style). This provides consistent, OS-independent canonicalization across all servers and correctly collapses path elements (<code>//</code>, <code>.</code>, <code>..</code>).</li>
+            <li><strong>For building filesystem paths</strong>: <code>path.resolve()</code>.
+            Reason: <code>path.resolve(root, relative)</code> is used to safely join the absolute root directory (<code>publicDir</code>) with the user-supplied relative path (<code>safeRel</code>). This function is essential for security as it computes the final, absolute file path which must then be checked against the root directory to prevent directory traversal attacks (e.g., trying to access <code>../../etc/passwd</code>).</li>
+        </ul>
+        <h2>Redundancy Resolution</h2>
+        <p>Redundancy is detected when multiple <strong>original</strong> URLs (e.g., <code>/about</code>, <code>/about/</code>, <code>/a//b</code>) map to the same <strong>canonical</strong> path (e.g., <code>/about</code>, <code>/a/b</code>). In this code, we simply serve the content, but a common resolution practice would be to use a permanent redirect (<strong>HTTP 301</strong>) from the redundant URL to the canonical URL for SEO and to simplify logging/caching.</p>
+    `;
+    res.type('html').send(explanation);
+});
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).send(`<h2>404 Not Found</h2><p>Requested: <code>${req.originalUrl}</code></p><p>Canonical: <code>${req.canonicalPath}</code></p>`);
+});
+
+app.listen(PORT, () => {
+    console.log(`App listening on http://localhost:${PORT} (PID ${process.pid})`);
+    console.log('Open /patterns to see tracked hits.');
+});
